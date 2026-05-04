@@ -36,5 +36,6 @@ OUTPUT solo JSON valido (sin markdown):
 {{"action":"buy|sell|hold","entry":float,"stop_loss":float,"take_profit":float,"risk_percent":1.0,"confidence":0-100,"reason":"breve"}}"""
 
 def fvg_agent(context, params):
-    prompt = PROMPT.format(**context, **params)
+    p = {k: v for k, v in params.items() if k not in context}
+    prompt = PROMPT.format(**context, **p)
     return run_agent(prompt)
