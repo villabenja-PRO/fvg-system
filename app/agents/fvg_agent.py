@@ -1,7 +1,6 @@
 from app.agents.base_agent import run_agent
 
-PROMPT = """Eres un agente de trading cuantitativo conectado a Binance.
-Analizas SOLO 1 sesión diaria basada en la primera vela de 5 minutos (09:30-09:35 EST).
+PROMPT = """Eres un agente FVG. Decides buy/sell/hold y calculas entry/SL/TP.
 
 INPUT:
 - symbol: {symbol}
@@ -15,27 +14,32 @@ INPUT:
 - fvg_gap_low: {fvg_gap_low}
 - last_close: {last_close}
 - atr: {atr}
-
-PARAMS (de WFO):
 - sl_mult: {sl_mult}
 - tp_mult: {tp_mult}
 - vol_min: {vol_min}
 - rvol_min: {rvol_min}
 
 REGLAS:
-1. Solo operar si volatility > vol_min y relative_volume > rvol_min
-2. Solo operar si fvg_detected = true
-3. Buy si fvg_direction=bullish y last_close rompe session_high
-4. Sell si fvg_direction=bearish y last_close rompe session_low
+1. Solo operar si volatility > vol_min Y relative_volume > rvol_min Y fvg_detected=true
+2. Buy si fvg_direction=bullish y last_close cerca de session_high
+3. Sell si fvg_direction=bearish y last_close cerca de session_low
+4. entry = last_close
 5. Stop loss = entry -/+ (atr * sl_mult)
-6. Take profit = entry +/- (atr * tp_mult) -> ratio 2R
-7. Risk = 1% capital
-8. Si no se cumplen reglas: action="hold"
+6. Take profit = entry +/- (atr * tp_mult)
+7. Si no aplica: action=hold con entry/SL/TP=0
 
 OUTPUT solo JSON valido (sin markdown):
 {{"action":"buy|sell|hold","entry":float,"stop_loss":float,"take_profit":float,"risk_percent":1.0,"confidence":0-100,"reason":"breve"}}"""
 
+NEEDED = ["symbol","volatility","relative_volume","session_high","session_low",
+          "fvg_detected","fvg_direction","fvg_gap_high","fvg_gap_low",
+          "last_close","atr","sl_mult","tp_mult","vol_min","rvol_min"]
+
 def fvg_agent(context, params):
-    p = {k: v for k, v in params.items() if k not in context}
-    prompt = PROMPT.format(**context, **p)
-    return run_agent(prompt)
+    data = {**context, **{k: v for k, v in params.items() if k not in context}}
+    safe = {k: data.get(k, "N/A") for k in NEEDED}
+    try:
+        prompt = PROMPT.format(**safe)
+        return run_agent(prompt)
+    except Exception as e:
+        return {"action": "hold", "confidence": 0, "error": f"fvg_agent: {e}"}
