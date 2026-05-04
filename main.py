@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI, BackgroundTasks
 from app.services.market import fetch_ohlcv
-from app.services.indicators import build_context
+from app.services.indicators import build_context, momentum_indicators, liquidity_levels
 from app.services import supa
 from app.agents.orchestrator import run_fvg_pipeline
 from app.backtest.wfo import walk_forward
@@ -22,7 +22,9 @@ def health():
 def trade_fvg(symbol: str = "BTCUSDT"):
     df = fetch_ohlcv(symbol, INTERVAL, 300)
     ctx = build_context(df, symbol, INTERVAL, MARKET)
-    decision = run_fvg_pipeline(ctx, symbol)
+    mom = momentum_indicators(df)
+    liq = liquidity_levels(df, INTERVAL, MARKET)
+    decision = run_fvg_pipeline(ctx, symbol, momentum=mom, liquidity=liq)
     if decision.get("action") in ("buy", "sell") and not decision.get("skipped"):
         sig = supa.insert("signals", {
             "symbol": symbol,
