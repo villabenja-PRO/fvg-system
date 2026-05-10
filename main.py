@@ -15,6 +15,9 @@ INTERVAL = os.getenv("FVG_INTERVAL", "15m")
 MARKET = os.getenv("FVG_MARKET", "crypto")
 PAPER = os.getenv("PAPER_TRADING", "true").lower() == "true"
 EMERGENCY_TOKEN = os.getenv("EMERGENCY_TOKEN", "change-me-please")
+# Shadow mode: relaja filtros para entrenar/validar agentes sin operar real
+SHADOW_VOL_MIN = float(os.getenv("SHADOW_VOL_MIN", "0.2"))
+SHADOW_RVOL_MIN = float(os.getenv("SHADOW_RVOL_MIN", "0.8"))
 
 @app.get("/health")
 def health():
@@ -46,7 +49,18 @@ def trade_fvg(symbol: str = "BTCUSDT"):
     mom = momentum_indicators(df)
     liq = liquidity_levels(df, INTERVAL, MARKET)
     decision = run_fvg_pipeline(ctx, symbol, momentum=mom, liquidity=liq)
-    if decision.get("action") in ("buy", "sell") and not decision.get("skipped"):
+
+    is_real_trade = decision.get("action") in ("buy", "sell") and not decision.get("skipped")
+    # Shadow trade: cualquier skip donde haya FVG + umbrales relajados se cumplen
+    is_shadow = (
+        not is_real_trade
+        and bool(ctx.get("fvg_detected"))
+        and ctx.get("atr", 0) > 0
+        and (ctx.get("volatility") or 0) >= SHADOW_VOL_MIN
+        and (ctx.get("relative_volume") or 0) >= SHADOW_RVOL_MIN
+    )
+
+    if is_real_trade or is_shadow:
         sig = supa.insert("signals", {
             "symbol": symbol,
             "direction": ctx.get("fvg_direction"),
@@ -57,25 +71,56 @@ def trade_fvg(symbol: str = "BTCUSDT"):
             "session_high": ctx["session_high"],
             "session_low": ctx["session_low"]
         })
-        existing = supa.select("trades",
-            f"?symbol=eq.{symbol}&status=eq.pending&limit=1")
-        if existing:
-            return {"context": ctx, "decision": {**decision, "skipped": True, "reason": "duplicate_pending"}}
-        supa.insert("trades", {
-            "symbol": symbol,
-            "signal_id": sig[0]["id"],
-            "action": decision["action"],
-            "entry": decision["entry"],
-            "stop_loss": decision["stop_loss"],
-            "take_profit": decision["take_profit"],
-            "risk_percent": decision.get("risk_percent", 1.0),
-            "confidence": decision.get("confidence", 0),
-            "size_usd": decision.get("size_usd", 0),
-            "is_simulated": PAPER,
-            "strategy_version": decision.get("strategy_version", "v1.0"),
-            "raw_ia_response": decision
-        })
-    return {"context": ctx, "decision": decision}
+
+        if is_real_trade:
+            existing = supa.select("trades",
+                f"?symbol=eq.{symbol}&status=eq.pending&shadow=eq.false&limit=1")
+            if existing:
+                return {"context": ctx, "decision": {**decision, "skipped": True, "reason": "duplicate_pending"}}
+            supa.insert("trades", {
+                "symbol": symbol,
+                "signal_id": sig[0]["id"],
+                "action": decision["action"],
+                "entry": decision["entry"],
+                "stop_loss": decision["stop_loss"],
+                "take_profit": decision["take_profit"],
+                "risk_percent": decision.get("risk_percent", 1.0),
+                "confidence": decision.get("confidence", 0),
+                "size_usd": decision.get("size_usd", 0),
+                "is_simulated": PAPER,
+                "shadow": False,
+                "strategy_version": decision.get("strategy_version", "v1.0"),
+                "raw_ia_response": decision
+            })
+        else:
+            # Shadow trade: calcula entry/SL/TP hipotético usando ATR
+            entry = ctx.get("last_close")
+            atr_val = ctx.get("atr", 0) or 0
+            direction = 1 if ctx.get("fvg_direction") == "bullish" else -1
+            sl = entry - direction * atr_val * 1.0 if entry and atr_val else 0
+            tp = entry + direction * atr_val * 2.0 if entry and atr_val else 0
+            action_inferred = "buy" if direction == 1 else "sell"
+
+            existing = supa.select("trades",
+                f"?symbol=eq.{symbol}&status=eq.pending&shadow=eq.true&limit=1")
+            if not existing and entry and sl:
+                supa.insert("trades", {
+                    "symbol": symbol,
+                    "signal_id": sig[0]["id"],
+                    "action": action_inferred,
+                    "entry": entry,
+                    "stop_loss": sl,
+                    "take_profit": tp,
+                    "risk_percent": 1.0,
+                    "confidence": decision.get("confidence", 0) or 50,
+                    "size_usd": 0,
+                    "is_simulated": True,
+                    "shadow": True,
+                    "strategy_version": decision.get("strategy_version", "v1.0"),
+                    "raw_ia_response": {**decision, "shadow_reason": decision.get("skip_reason") or decision.get("reason")}
+                })
+
+    return {"context": ctx, "decision": decision, "is_shadow": is_shadow}
 
 @app.post("/wfo/run")
 def wfo_run(symbol: str = "BTCUSDT", days: int = 90, bg: BackgroundTasks = None):
@@ -103,37 +148,40 @@ def backtest(symbol: str = "BTCUSDT", days: int = 30):
     return {"params": p, "metrics": metrics(trades), "n_trades": len(trades)}
 
 @app.get("/metrics")
-def get_metrics(days: int = 30, symbol: str = None):
-    """Métricas en tiempo real desde la DB."""
+def get_metrics(days: int = 30, symbol: str = None, include_shadow: bool = True):
+    """Métricas en tiempo real. Por defecto incluye shadow para evaluar la estrategia."""
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-    flt = f"?ts=gte.{since}&status=in.(win,loss,timeout)"
-    if symbol:
-        flt += f"&symbol=eq.{symbol}"
-    trades = supa.select("trades", flt)
-    if not trades:
-        return {"trades": 0, "winrate": 0, "pf": 0, "pnl_total": 0, "days": days}
 
-    wins = [t for t in trades if t["status"] == "win"]
-    losses = [t for t in trades if t["status"] == "loss"]
-    pnl_wins = sum(float(t.get("pnl_usd") or 0) for t in wins)
-    pnl_losses = abs(sum(float(t.get("pnl_usd") or 0) for t in losses))
-    pnl_total = sum(float(t.get("pnl_usd") or 0) for t in trades)
+    def _calc(flt_extra):
+        flt = f"?ts=gte.{since}&status=in.(win,loss,timeout)" + flt_extra
+        if symbol:
+            flt += f"&symbol=eq.{symbol}"
+        trades = supa.select("trades", flt)
+        if not trades:
+            return {"trades": 0, "wins": 0, "losses": 0, "winrate": 0, "pf": None, "pnl_total": 0, "avg_r": 0}
+        wins = [t for t in trades if t["status"] == "win"]
+        losses = [t for t in trades if t["status"] == "loss"]
+        pnl_wins = sum(float(t.get("pnl_usd") or 0) for t in wins)
+        pnl_losses = abs(sum(float(t.get("pnl_usd") or 0) for t in losses))
+        pnl_total = sum(float(t.get("pnl_usd") or 0) for t in trades)
+        return {
+            "trades": len(trades),
+            "wins": len(wins),
+            "losses": len(losses),
+            "winrate": round(len(wins) / len(trades) * 100, 2),
+            "pf": round(pnl_wins / pnl_losses, 2) if pnl_losses > 0 else None,
+            "pnl_total": round(pnl_total, 2),
+            "avg_r": round(sum(float(t.get("pnl_r") or 0) for t in trades) / len(trades), 2)
+        }
 
-    # Cooldown stats
-    last_loss = max([t["closed_at"] for t in losses if t.get("closed_at")], default=None)
+    real = _calc("&shadow=eq.false")
+    out = {"days": days, "symbol": symbol or "all", **real}
 
-    return {
-        "days": days,
-        "symbol": symbol or "all",
-        "trades": len(trades),
-        "wins": len(wins),
-        "losses": len(losses),
-        "winrate": round(len(wins) / len(trades) * 100, 2),
-        "pf": round(pnl_wins / pnl_losses, 2) if pnl_losses > 0 else None,
-        "pnl_total": round(pnl_total, 2),
-        "avg_r": round(sum(float(t.get("pnl_r") or 0) for t in trades) / len(trades), 2),
-        "last_loss_at": last_loss
-    }
+    if include_shadow:
+        shadow = _calc("&shadow=eq.true")
+        out["shadow"] = shadow
+
+    return out
 
 @app.get("/decisions/recent")
 def decisions_recent(limit: int = 20):
