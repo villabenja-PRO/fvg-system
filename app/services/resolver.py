@@ -56,6 +56,8 @@ def resolve_pending():
             "pnl_usd": pnl,
             "closed_at": datetime.now(timezone.utc).isoformat()
         })
-        register_trade(pnl)
-        resolved.append({"id": t["id"], "outcome": outcome, "pnl_usd": pnl, "r": r_mult})
+        # Shadow trades NO afectan risk_state (no son operaciones reales)
+        if not t.get("shadow"):
+            register_trade(pnl)
+        resolved.append({"id": t["id"], "outcome": outcome, "pnl_usd": pnl, "r": r_mult, "shadow": bool(t.get("shadow"))})
     return resolved
